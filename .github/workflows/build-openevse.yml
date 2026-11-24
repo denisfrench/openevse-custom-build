@@ -1,0 +1,211 @@
+# Build OpenEVSE controller firmware (open_evse) with a few build flags changed.
+#
+# Nothing is forked: the workflow checks out OpenEVSE/open_evse at the ref you
+# choose, edits the platformio.ini files in that temporary checkout, builds with
+# the same PlatformIO version upstream's CI pins, and publishes the hex as an
+# artifact. Run it from the "Actions" tab (Run workflow).
+
+name: Build OpenEVSE controller firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "open_evse tag, branch or commit SHA (prefer a full SHA for dev)"
+        type: string
+        required: true
+        default: "9.0.0"
+      pio_env:
+        description: "PlatformIO env (m328p_LCD_WIFI = 9.0.0/master, m328p_core_lcd = dev)"
+        type: choice
+        required: true
+        default: m328p_LCD_WIFI
+        options:
+          - m328p_LCD_WIFI
+          - m328p_core_lcd
+      add_btn_menu:
+        description: "Add -D BTN_MENU (front button and menus)"
+        type: boolean
+        default: true
+      drop_mennekes:
+        description: "Remove -D MENNEKES_LOCK"
+        type: boolean
+        default: true
+      drop_cable_temp:
+        description: "Remove -D CABLE_TEMPERATURE_MONITORING (only exists on dev)"
+        type: boolean
+        default: true
+      drop_relay_pwm:
+        description: "Remove -D RELAY_PWM"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REF: ${{ inputs.ref }}
+      PIO_ENV: ${{ inputs.pio_env }}
+      ADD_BTN_MENU: ${{ inputs.add_btn_menu }}
+      DROP_MENNEKES: ${{ inputs.drop_mennekes }}
+      DROP_CABLE_TEMP: ${{ inputs.drop_cable_temp }}
+      DROP_RELAY_PWM: ${{ inputs.drop_relay_pwm }}
+
+    steps:
+      - name: Check out upstream open_evse
+        uses: actions/checkout@v5
+        with:
+          repository: OpenEVSE/open_evse
+          ref: ${{ inputs.ref }}
+          path: open_evse
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-6.1.5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO (same version as upstream CI)
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio==6.1.5
+
+      - name: Apply flag changes to the temporary checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd open_evse
+
+          ENV_FILE=$(grep -lF "[env:${PIO_ENV}]" platformio.ini firmware/targets/*/platformio.ini 2>/dev/null | head -n 1 || true)
+          if [ -z "$ENV_FILE" ]; then
+            echo "::error::env '${PIO_ENV}' not found at ref '${REF}' (m328p_LCD_WIFI is 9.0.0/master, m328p_core_lcd is dev)"
+            exit 1
+          fi
+          FILES=$(printf '%s\n' platformio.ini "$ENV_FILE" | sort -u)
+          echo "env ${PIO_ENV} is defined in ${ENV_FILE}"
+
+          # drop_flag NAME required|optional : delete "-D NAME" lines from the ini files
+          drop_flag() {
+            local name="$1" required="$2" total=0 n f
+            local pat="^[[:space:]]*-D[[:space:]]+${name}[[:space:]]*(#.*)?\$"
+            for f in $FILES; do
+              n=$(grep -Ec "$pat" "$f" || true)
+              if [ "${n:-0}" -gt 0 ]; then
+                sed -i -E "/${pat}/d" "$f"
+                total=$((total + n))
+              fi
+            done
+            if [ "$total" -eq 0 ]; then
+              if [ "$required" = required ]; then
+                echo "::error::-D ${name} not found; the upstream layout has changed, review before building"
+                exit 1
+              fi
+              echo "::notice::-D ${name} is not present at this ref; nothing to remove"
+            else
+              echo "Removed ${total} line(s) for -D ${name}"
+            fi
+          }
+
+          if [ "$DROP_MENNEKES" = true ]; then drop_flag MENNEKES_LOCK required; fi
+          if [ "$DROP_RELAY_PWM" = true ]; then drop_flag RELAY_PWM required; fi
+          if [ "$DROP_CABLE_TEMP" = true ]; then drop_flag CABLE_TEMPERATURE_MONITORING optional; fi
+
+          if [ "$ADD_BTN_MENU" = true ]; then
+            present=$(awk -v e="$PIO_ENV" '
+              /^\[/ { s = (index($0, "[env:" e "]") == 1) }
+              s && /^[[:space:]]*-D[[:space:]]+BTN_MENU[[:space:]]*(#.*)?$/ { c++ }
+              END { print c + 0 }' "$ENV_FILE")
+            if [ "$present" -gt 0 ]; then
+              echo "::notice::BTN_MENU is already enabled for ${PIO_ENV} at this ref; nothing to add"
+            else
+              # Insert "-D BTN_MENU" straight after "-D RGBLCD" inside the chosen env's section.
+              awk -v e="$PIO_ENV" '
+                /^\[/ { s = (index($0, "[env:" e "]") == 1) }
+                { print }
+                s && !done && /^[[:space:]]*-D[[:space:]]+RGBLCD[[:space:]]*(#.*)?$/ { print "  -D BTN_MENU"; done = 1 }
+                END { if (!done) exit 3 }' "$ENV_FILE" > "${ENV_FILE}.new" || {
+                  echo "::error::could not find '-D RGBLCD' in [env:${PIO_ENV}] to anchor BTN_MENU"
+                  exit 1
+                }
+              mv "${ENV_FILE}.new" "$ENV_FILE"
+            fi
+          fi
+
+          echo "---- changes applied to the temporary checkout ----"
+          git --no-pager diff
+
+      - name: Build with PlatformIO
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd open_evse
+          pio run -e "$PIO_ENV" -v 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Check the flags that actually reached the compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$GITHUB_WORKSPACE/build.log"
+          flag_in_log() { grep -Eq -- "-D ?$1([^A-Za-z0-9_]|\$)" "$LOG"; }
+
+          if [ "$ADD_BTN_MENU" = true ] && ! flag_in_log BTN_MENU; then
+            echo "::error::BTN_MENU is not in the compile commands"
+            exit 1
+          fi
+          for pair in DROP_MENNEKES:MENNEKES_LOCK DROP_CABLE_TEMP:CABLE_TEMPERATURE_MONITORING DROP_RELAY_PWM:RELAY_PWM; do
+            var=${pair%%:*}
+            flag=${pair#*:}
+            if [ "${!var}" = true ] && flag_in_log "$flag"; then
+              echo "::error::-D ${flag} is still in the compile commands"
+              exit 1
+            fi
+          done
+          echo "Flag check passed"
+
+      - name: Package output
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git -C open_evse rev-parse HEAD)
+          NAME="openevse-${PIO_ENV}-${SHA:0:8}"
+          mkdir -p dist
+          cp "open_evse/.pio/build/${PIO_ENV}/firmware.hex" "dist/${NAME}.hex"
+          cp build.log dist/build.log
+          SIZES=$(grep -E '^(RAM|Flash):' build.log || true)
+          {
+            echo "Upstream:        https://github.com/OpenEVSE/open_evse"
+            echo "Requested ref:   ${REF}"
+            echo "Resolved commit: ${SHA}"
+            echo "Env:             ${PIO_ENV}"
+            echo "Built (UTC):     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "PlatformIO:      $(pio --version)"
+            echo "Add BTN_MENU:    ${ADD_BTN_MENU}"
+            echo "Drop MENNEKES:   ${DROP_MENNEKES}"
+            echo "Drop CABLE_TEMP: ${DROP_CABLE_TEMP}"
+            echo "Drop RELAY_PWM:  ${DROP_RELAY_PWM}"
+            echo
+            echo "${SIZES}"
+            echo
+            echo "SHA-256:"
+            (cd dist && sha256sum "${NAME}.hex")
+            echo
+            echo "Changes applied to upstream files:"
+            git -C open_evse --no-pager diff
+          } > dist/BUILD-INFO.txt
+          cat dist/BUILD-INFO.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+          if-no-files-found: error
