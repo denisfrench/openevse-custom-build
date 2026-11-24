@@ -53,6 +53,9 @@ jobs:
       DROP_MENNEKES: ${{ inputs.drop_mennekes }}
       DROP_CABLE_TEMP: ${{ inputs.drop_cable_temp }}
       DROP_RELAY_PWM: ${{ inputs.drop_relay_pwm }}
+      # Warn (annotation + summary) at or above these percentages. Rules of thumb, adjust freely.
+      FLASH_WARN_PCT: "90"
+      RAM_WARN_PCT: "80"
 
     steps:
       - name: Check out upstream open_evse
@@ -170,6 +173,62 @@ jobs:
           done
           echo "Flag check passed"
 
+      - name: Check memory usage
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$GITHUB_WORKSPACE/build.log"
+
+          # Reads "Flash: [====  ]  78.2% (used 25630 bytes from 32768 bytes)" style lines.
+          parse() {
+            grep -E "^$1:" "$LOG" | tail -n 1 | sed -nE 's/.*\(used ([0-9]+) bytes from ([0-9]+) bytes\).*/\1 \2/p'
+          }
+          read -r FLASH_USED FLASH_TOTAL <<< "$(parse Flash)" || true
+          read -r RAM_USED RAM_TOTAL <<< "$(parse RAM)" || true
+          for v in FLASH_USED FLASH_TOTAL RAM_USED RAM_TOTAL; do
+            if ! [[ "${!v:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::could not read ${v} from the PlatformIO output; check build.log"
+              exit 1
+            fi
+          done
+
+          pct() { awk -v u="$1" -v t="$2" 'BEGIN { printf "%.1f", u * 100 / t }'; }
+          at_least() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+          FLASH_PCT=$(pct "$FLASH_USED" "$FLASH_TOTAL")
+          RAM_PCT=$(pct "$RAM_USED" "$RAM_TOTAL")
+
+          if [ "$FLASH_USED" -gt "$FLASH_TOTAL" ]; then
+            echo "::error title=Flash overflow::Flash is over the limit by $((FLASH_USED - FLASH_TOTAL)) bytes (${FLASH_USED} of ${FLASH_TOTAL})"
+            exit 1
+          fi
+          if [ "$RAM_USED" -gt "$RAM_TOTAL" ]; then
+            echo "::error title=RAM overflow::Static RAM is over the limit by $((RAM_USED - RAM_TOTAL)) bytes (${RAM_USED} of ${RAM_TOTAL})"
+            exit 1
+          fi
+
+          WARN=""
+          if at_least "$FLASH_PCT" "$FLASH_WARN_PCT"; then
+            MSG="Flash is at ${FLASH_PCT}% (${FLASH_USED} of ${FLASH_TOTAL} bytes, $((FLASH_TOTAL - FLASH_USED)) free)."
+            echo "::warning title=Flash nearly full::${MSG}"
+            WARN="${WARN}${MSG} "
+          fi
+          if at_least "$RAM_PCT" "$RAM_WARN_PCT"; then
+            MSG="Static RAM is at ${RAM_PCT}% (${RAM_USED} of ${RAM_TOTAL} bytes); the stack also needs RAM."
+            echo "::warning title=RAM getting full::${MSG}"
+            WARN="${WARN}${MSG} "
+          fi
+
+          echo "Flash: ${FLASH_USED}/${FLASH_TOTAL} bytes (${FLASH_PCT}%)   RAM: ${RAM_USED}/${RAM_TOTAL} bytes (${RAM_PCT}%)"
+          {
+            echo "FLASH_USED=${FLASH_USED}"
+            echo "FLASH_TOTAL=${FLASH_TOTAL}"
+            echo "FLASH_PCT=${FLASH_PCT}"
+            echo "RAM_USED=${RAM_USED}"
+            echo "RAM_TOTAL=${RAM_TOTAL}"
+            echo "RAM_PCT=${RAM_PCT}"
+            echo "MEM_WARNINGS=${WARN}"
+          } >> "$GITHUB_ENV"
+
       - name: Package output
         shell: bash
         run: |
@@ -200,7 +259,22 @@ jobs:
             echo "Changes applied to upstream files:"
             git -C open_evse --no-pager diff
           } > dist/BUILD-INFO.txt
-          cat dist/BUILD-INFO.txt >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## OpenEVSE build: ${PIO_ENV} @ ${SHA:0:8}"
+            echo
+            echo "| Memory | Used (bytes) | Total (bytes) | Free (bytes) | Used |"
+            echo "|---|---:|---:|---:|---:|"
+            echo "| Flash | ${FLASH_USED} | ${FLASH_TOTAL} | $((FLASH_TOTAL - FLASH_USED)) | ${FLASH_PCT}% |"
+            echo "| RAM | ${RAM_USED} | ${RAM_TOTAL} | $((RAM_TOTAL - RAM_USED)) | ${RAM_PCT}% |"
+            echo
+            if [ -n "${MEM_WARNINGS:-}" ]; then
+              echo "> **Warning:** ${MEM_WARNINGS}"
+              echo
+            fi
+            echo '```'
+            cat dist/BUILD-INFO.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
